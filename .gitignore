@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime logs
+*.log
+
+# ESP-IDF / CMake build output
+build/
+device/src/build/
+device/src/managed_components/
+sdkconfig
+sdkconfig.old
+
+# PlatformIO / editors
+.pio/
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+.DS_Store
