@@ -32,7 +32,8 @@ APP.native_gc_every = 4
 APP.native_chunk_rows = 16
 APP.native_swap_color_bytes = false
 APP.native_chunked = false
-APP.native_direct_present = true
+APP.native_direct_present = false
+APP.native_img_userdata = true
 APP.native_async = true
 APP.last_debug_ms = 0
 APP.last_debug_frame_count = 0
@@ -63,6 +64,7 @@ APP.ws = nil
 APP.jpg = nil
 APP.native_jpg = true
 APP.native_canvas = false
+APP.native_lvgl_image = true
 APP.reconnect_timer = nil
 APP.stat_timer = nil
 APP.process_timer = nil
@@ -206,6 +208,11 @@ local function load_config()
     APP.native_direct_present = native_direct_present
   end
 
+  local native_img_userdata = json_bool(raw, "native_img_userdata")
+  if native_img_userdata ~= nil then
+    APP.native_img_userdata = native_img_userdata
+  end
+
   local native_async = json_bool(raw, "native_async")
   if native_async ~= nil then
     APP.native_async = native_async
@@ -236,7 +243,12 @@ local function load_jpg_module()
     print("[dmirror] fatal: " .. APP.fatal_error)
     return
   end
-  if (not APP.native_direct_present) and (not lv_canvas_create or not lv_canvas_blit_rgb565) then
+  if APP.native_img_userdata and not lv_img_set_src then
+    APP.fatal_error = "Native JPEG image mode requires lv_img_set_src"
+    print("[dmirror] fatal: " .. APP.fatal_error)
+    return
+  end
+  if (not APP.native_direct_present) and (not APP.native_img_userdata) and (not lv_canvas_create or not lv_canvas_blit_rgb565) then
     APP.fatal_error = "Native JPEG canvas mode requires canvas/blit"
     print("[dmirror] fatal: " .. APP.fatal_error)
     return
@@ -258,13 +270,16 @@ local function load_jpg_module()
       if ok and type(mod) == "table" and type(mod.decode) == "function" then
         if type(mod.submit) ~= "function" then
           last_err = "module missing async submit API"
+        elseif APP.native_img_userdata and type(mod.read_ready_image) ~= "function" then
+          last_err = "module missing LVGL image API"
         elseif APP.native_direct_present and type(mod.present_ready) ~= "function" then
           last_err = "module missing async direct present API"
-        elseif (not APP.native_direct_present) and type(mod.read_ready) ~= "function" then
+        elseif (not APP.native_direct_present) and (not APP.native_img_userdata) and type(mod.read_ready) ~= "function" then
           last_err = "module missing async canvas API"
         else
           APP.jpg = mod
-          APP.native_canvas = not APP.native_direct_present
+          APP.native_canvas = (not APP.native_direct_present) and (not APP.native_img_userdata)
+          APP.native_lvgl_image = APP.native_img_userdata
           print("[dmirror] native jpg module loaded: " .. path)
           return
         end
@@ -277,6 +292,7 @@ local function load_jpg_module()
   end
 
   APP.native_canvas = false
+  APP.native_lvgl_image = false
   APP.fatal_error = "Native JPEG module unavailable: " .. last_err
   print("[dmirror] fatal: " .. APP.fatal_error)
 end
@@ -311,9 +327,16 @@ local function update_status()
   end
 end
 
+local function update_fps_label()
+  if APP.ui.fps then
+    lv_label_set_text(APP.ui.fps, string.format("%.1f fps", APP.stat.fps or 0))
+  end
+end
+
 local function update_overlay_visible()
   set_obj_hidden(APP.ui.panel, not APP.overlay)
   update_status()
+  update_fps_label()
 end
 
 local function show_error_screen(text)
@@ -445,8 +468,31 @@ local function build_ui()
     end
   end
 
+  APP.ui.fps_panel = lv_obj_create(root)
+  lv_obj_set_pos(APP.ui.fps_panel, 4, SCREEN_H - 22)
+  lv_obj_set_size(APP.ui.fps_panel, 74, 18)
+  style_plain_panel(APP.ui.fps_panel, 0x000000, 180)
+  lv_obj_set_style_radius(APP.ui.fps_panel, 4, MAIN_STYLE)
+
+  APP.ui.fps = lv_label_create(APP.ui.fps_panel)
+  lv_obj_set_pos(APP.ui.fps, 4, 2)
+  lv_obj_set_size(APP.ui.fps, 66, 14)
+  lv_obj_set_style_text_color(APP.ui.fps, 0x66FF99, MAIN_STYLE)
+  lv_obj_set_style_text_opa(APP.ui.fps, 255, MAIN_STYLE)
+  if lv_obj_set_style_text_font then
+    pcall(function()
+      lv_obj_set_style_text_font(APP.ui.fps, LV_FONT_MONTSERRAT_10 or 10, MAIN_STYLE)
+    end)
+  end
+  if lv_label_set_long_mode and LV_LABEL_LONG_CLIP then
+    pcall(function()
+      lv_label_set_long_mode(APP.ui.fps, LV_LABEL_LONG_CLIP)
+    end)
+  end
+  update_fps_label()
+
   APP.ui.panel = lv_obj_create(root)
-  lv_obj_set_pos(APP.ui.panel, 4, SCREEN_H - 22)
+  lv_obj_set_pos(APP.ui.panel, 4, 4)
   lv_obj_set_size(APP.ui.panel, 84, 18)
   style_plain_panel(APP.ui.panel, 0x000000, 180)
   lv_obj_set_style_radius(APP.ui.panel, 4, MAIN_STYLE)
@@ -595,7 +641,8 @@ local function display_frame(data)
   end
 
   local use_async_native = APP.native_async and APP.jpg and type(APP.jpg.submit) == "function" and
-    ((APP.native_direct_present and type(APP.jpg.present_ready) == "function") or
+    ((APP.native_img_userdata and type(APP.jpg.read_ready_image) == "function") or
+      (APP.native_direct_present and type(APP.jpg.present_ready) == "function") or
       (APP.native_canvas and type(APP.jpg.read_ready) == "function"))
 
   if APP.has_frame_id and not use_async_native then
@@ -784,6 +831,11 @@ local function display_frame(data)
   APP.last_error = ""
   APP.last_error_log_ms = 0
 
+  if APP.ui.fps_panel and lv_obj_move_foreground then
+    pcall(function()
+      lv_obj_move_foreground(APP.ui.fps_panel)
+    end)
+  end
   if APP.ui.panel and APP.overlay and lv_obj_move_foreground then
     pcall(function()
       lv_obj_move_foreground(APP.ui.panel)
@@ -832,6 +884,69 @@ local function present_ready_frame()
     return
   end
 
+  if APP.native_img_userdata and type(APP.jpg.read_ready_image) == "function" and APP.ui.img then
+    local read_ok, img_or_err, out_w, out_h, stats = pcall(function()
+      return APP.jpg.read_ready_image()
+    end)
+    if not read_ok then
+      fatal_stop("native read_ready_image failed: " .. tostring(img_or_err or "read_ready_image"))
+      return
+    end
+    if img_or_err == nil then
+      return
+    end
+    if out_w ~= SCREEN_W or out_h ~= SCREEN_H then
+      fatal_stop("native read_ready_image size mismatch: " .. tostring(out_w) .. "x" .. tostring(out_h))
+      return
+    end
+
+    local set_src_start_us = now_us()
+    local set_ok, set_err = pcall(function()
+      lv_img_set_src(APP.ui.img, img_or_err)
+    end)
+    if not set_ok then
+      fatal_stop("lvgl image set_src failed: " .. tostring(set_err or "set_src"))
+      return
+    end
+
+    stats = stats or {}
+    local frame_id = tonumber(stats.frame_id) or 0
+    local input_bytes = tonumber(stats.input_bytes) or 0
+    if frame_id > 0 then
+      if APP.has_frame_id then
+        if frame_id <= APP.last_frame_id then
+          APP.out_of_order_count = APP.out_of_order_count + 1
+        elseif frame_id > APP.last_frame_id + 1 then
+          APP.drop_count = APP.drop_count + (frame_id - APP.last_frame_id - 1)
+        end
+      end
+      APP.last_frame_id = frame_id
+      APP.has_frame_id = true
+    end
+
+    APP.frame_count = APP.frame_count + 1
+    APP.byte_count = APP.byte_count + input_bytes
+    APP.last_rx_ms = now_ms()
+    APP.last_error = ""
+    APP.last_error_log_ms = 0
+    APP.last_native_decode_us = tonumber(stats.decode_us) or APP.last_native_decode_us
+    APP.last_native_decode_ms = math.floor((APP.last_native_decode_us or 0) / 1000)
+    APP.last_present_us = elapsed_us(set_src_start_us)
+    APP.last_present_ms = math.floor((APP.last_present_us or 0) / 1000)
+
+    if APP.ui.fps_panel and lv_obj_move_foreground then
+      pcall(function()
+        lv_obj_move_foreground(APP.ui.fps_panel)
+      end)
+    end
+    if APP.ui.panel and APP.overlay and lv_obj_move_foreground then
+      pcall(function()
+        lv_obj_move_foreground(APP.ui.panel)
+      end)
+    end
+    return
+  end
+
   if APP.native_direct_present and type(APP.jpg.present_ready) == "function" then
     local present_ok, presented_or_err, stats = pcall(function()
       return APP.jpg.present_ready()
@@ -868,6 +983,16 @@ local function present_ready_frame()
     APP.last_native_decode_ms = math.floor((APP.last_native_decode_us or 0) / 1000)
     APP.last_present_us = tonumber(stats.push_us) or APP.last_present_us
     APP.last_present_ms = math.floor((APP.last_present_us or 0) / 1000)
+    if APP.ui.fps_panel and lv_obj_move_foreground then
+      pcall(function()
+        lv_obj_move_foreground(APP.ui.fps_panel)
+      end)
+    end
+    if APP.ui.panel and APP.overlay and lv_obj_move_foreground then
+      pcall(function()
+        lv_obj_move_foreground(APP.ui.panel)
+      end)
+    end
     return
   end
 
@@ -926,6 +1051,16 @@ local function present_ready_frame()
   APP.last_native_decode_ms = math.floor((APP.last_native_decode_us or 0) / 1000)
   APP.last_present_us = elapsed_us(blit_start_us)
   APP.last_present_ms = math.floor((APP.last_present_us or 0) / 1000)
+  if APP.ui.fps_panel and lv_obj_move_foreground then
+    pcall(function()
+      lv_obj_move_foreground(APP.ui.fps_panel)
+    end)
+  end
+  if APP.ui.panel and APP.overlay and lv_obj_move_foreground then
+    pcall(function()
+      lv_obj_move_foreground(APP.ui.panel)
+    end)
+  end
 end
 
 local function close_ws()
@@ -1030,6 +1165,7 @@ local function start_timers()
       APP.stat.bytes = APP.byte_count
       APP.stat.rx_binary = APP.rx_binary_count
       APP.stat.last_ms = ts
+      update_fps_label()
       if APP.serial_debug then
         print(string.format(
           "[dmirror][fps] display=%.1f rx=%.1f kbps=%.0f frames=%d submitted=%d drop=%d overwrite=%d empty=%d order_err=%d native_decode=%dus present=%dus",

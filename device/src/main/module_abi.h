@@ -120,6 +120,7 @@ typedef int (*module_lua_cfunction_t)(lua_State *L);
 #define MODULE_PROC_LUA_TOLSTRING_V1 0x00090024u
 #define MODULE_PROC_LUA_CHECKLSTRING_V1 0x00090025u
 #define MODULE_PROC_LUA_PUSHLSTRING_V1 0x00090026u
+#define MODULE_PROC_LUA_NEWUSERDATA_V1 0x00090027u
 
 #define MODULE_PROC_I2S_BEGIN_V1 0x000A0001u
 #define MODULE_PROC_I2S_WRITE_V1 0x000A0002u
@@ -454,6 +455,7 @@ typedef struct module_lua_api_t {
     const char *(*tolstring)(lua_State *L, int idx, size_t *out_len);
     const char *(*checklstring)(lua_State *L, int idx, size_t *out_len);
     void (*pushlstring)(lua_State *L, const char *data, size_t len);
+    void *(*newuserdata)(lua_State *L, size_t size);
 } module_lua_api_t;
 
 typedef struct module_diag_api_t {
@@ -677,6 +679,7 @@ static inline int32_t module_sdk_resolve_host_v2(module_host_resolve_v2_fn resol
     MODULE_SDK_RESOLVE_PROC_V2(resolve, resolve_ctx, MODULE_PROC_LUA_TOLSTRING_V1, out->lua.tolstring);
     MODULE_SDK_RESOLVE_PROC_V2(resolve, resolve_ctx, MODULE_PROC_LUA_CHECKLSTRING_V1, out->lua.checklstring);
     MODULE_SDK_RESOLVE_PROC_V2(resolve, resolve_ctx, MODULE_PROC_LUA_PUSHLSTRING_V1, out->lua.pushlstring);
+    MODULE_SDK_RESOLVE_PROC_V2(resolve, resolve_ctx, MODULE_PROC_LUA_NEWUSERDATA_V1, out->lua.newuserdata);
 
     out->i2s.size = sizeof(out->i2s);
     MODULE_SDK_RESOLVE_PROC_V2(resolve, resolve_ctx, MODULE_PROC_I2S_BEGIN_V1, out->i2s.begin);

@@ -20,8 +20,24 @@
 #define JPG_DMA_MIN_ROWS 1u
 #define JPG_DMA_BUFFERS 2u
 #define JPG_ASYNC_RGB_BUFFERS 2u
+#define JPG_ENABLE_LVGL_USERDATA 1
+#define JPG_LV_IMG_CF_TRUE_COLOR 4u
 #define JPG_USE_ESP_NEW_JPEG 1
 #define JPG_CLOSE_NEW_DECODER_ON_DESTROY 0
+
+typedef struct jpg_lv_img_header_t {
+    uint32_t cf : 5;
+    uint32_t always_zero : 3;
+    uint32_t reserved : 2;
+    uint32_t w : 11;
+    uint32_t h : 11;
+} jpg_lv_img_header_t;
+
+typedef struct jpg_lv_img_dsc_t {
+    jpg_lv_img_header_t header;
+    uint32_t data_size;
+    const uint8_t *data;
+} jpg_lv_img_dsc_t;
 
 #if defined(CONFIG_JD_USE_ROM) && CONFIG_JD_USE_ROM
 #define JPG_WORK_BUFFER_SIZE 4096u
@@ -639,6 +655,46 @@ static int push_error(lua_State *L, const module_host_api_v2 *host, const char *
     return 2;
 }
 
+static int jpg_push_rgb565_image_userdata(lua_State *L,
+                                          jpg_instance_t *inst,
+                                          const uint8_t *rgb565,
+                                          uint32_t width,
+                                          uint32_t height,
+                                          uint32_t bytes)
+{
+    jpg_lv_img_dsc_t *dsc = NULL;
+    uint8_t *pixels = NULL;
+    size_t header_size = sizeof(jpg_lv_img_dsc_t);
+    size_t total = 0;
+
+    if (!L || !inst || !rgb565 || width == 0 || height == 0 || bytes == 0) {
+        return 0;
+    }
+    if (bytes < (uint32_t)((size_t)width * (size_t)height * 2u)) {
+        return 0;
+    }
+    total = header_size + bytes;
+    if (!inst->host.lua.newuserdata) {
+        return 0;
+    }
+    dsc = (jpg_lv_img_dsc_t *)inst->host.lua.newuserdata(L, total);
+    if (!dsc) {
+        return 0;
+    }
+    zero_bytes(dsc, header_size);
+    pixels = ((uint8_t *)dsc) + header_size;
+    copy_bytes(pixels, rgb565, bytes);
+
+    dsc->header.cf = JPG_LV_IMG_CF_TRUE_COLOR;
+    dsc->header.always_zero = 0;
+    dsc->header.reserved = 0;
+    dsc->header.w = width;
+    dsc->header.h = height;
+    dsc->data_size = bytes;
+    dsc->data = pixels;
+    return 1;
+}
+
 static uint64_t jpg_now_us(const module_host_api_v2 *host)
 {
     if (host && host->time.micros) {
@@ -1105,6 +1161,71 @@ static int l_jpg_read_ready(lua_State *L)
 
     t0 = jpg_now_us(host);
     host->lua.pushlstring(L, (const char *)rgb, output_bytes);
+    t1 = jpg_now_us(host);
+
+    jpg_async_lock(inst);
+    inst->async_presenting_index = -1;
+    inst->async_present_count++;
+    inst->async_last_present_frame_id = frame_id;
+    inst->async_last_input_bytes = input_bytes;
+    inst->async_last_output_bytes = output_bytes;
+    inst->last_push_us = t1 >= t0 ? (uint32_t)(t1 - t0) : 0;
+    inst->last_push_ms = inst->last_push_us / 1000u;
+    jpg_async_unlock(inst);
+
+    host->lua.pushinteger(L, 320);
+    host->lua.pushinteger(L, 240);
+    push_stats(L, inst);
+    return 4;
+}
+
+static int l_jpg_read_ready_image(lua_State *L)
+{
+    jpg_instance_t *inst = instance_from_lua(L);
+    module_host_api_v2 *host = inst ? &inst->host : NULL;
+    int idx = -1;
+    uint8_t *rgb = NULL;
+    uint32_t frame_id = 0;
+    uint32_t input_bytes = 0;
+    uint32_t output_bytes = 0;
+    uint64_t t0 = 0;
+    uint64_t t1 = 0;
+
+    if (!inst || !host) {
+        return push_error(L, host, "jpg.read_ready_image: instance missing");
+    }
+
+    jpg_async_lock(inst);
+    idx = inst->async_ready_index;
+    if (idx < 0) {
+        jpg_async_unlock(inst);
+        host->lua.pushnil(L);
+        return 1;
+    }
+    inst->async_ready_index = -1;
+    inst->async_presenting_index = idx;
+    rgb = inst->async_rgb[idx];
+    frame_id = inst->async_rgb_frame_id[idx];
+    input_bytes = inst->async_rgb_input_bytes[idx];
+    output_bytes = inst->async_rgb_len[idx];
+    jpg_async_unlock(inst);
+
+    if (!rgb || output_bytes == 0) {
+        jpg_async_lock(inst);
+        inst->async_presenting_index = -1;
+        inst->async_error_count++;
+        jpg_async_unlock(inst);
+        return push_error(L, host, "jpg.read_ready_image: decoded buffer missing");
+    }
+
+    t0 = jpg_now_us(host);
+    if (!jpg_push_rgb565_image_userdata(L, inst, rgb, 320u, 240u, output_bytes)) {
+        jpg_async_lock(inst);
+        inst->async_presenting_index = -1;
+        inst->async_error_count++;
+        jpg_async_unlock(inst);
+        return push_error(L, host, "jpg.read_ready_image: userdata alloc failed");
+    }
     t1 = jpg_now_us(host);
 
     jpg_async_lock(inst);
@@ -1629,7 +1750,8 @@ JPG_MODULE_EXPORT int32_t module_create_v2(module_host_resolve_v2_fn resolve,
     if (rc != MODULE_OK) {
         return rc;
     }
-    if (!host.heap.calloc || !host.heap.free || !host.lua.checklstring || !host.lua.pushlstring) {
+    if (!host.heap.calloc || !host.heap.free || !host.lua.checklstring ||
+        !host.lua.pushlstring || !host.lua.newuserdata) {
         return MODULE_ERR_UNSUPPORTED;
     }
 
@@ -1657,7 +1779,7 @@ JPG_MODULE_EXPORT int32_t module_luaopen_v1(void *instance, lua_State *L)
         return MODULE_ERR_INVALID_ARG;
     }
 
-    host->lua.createtable(L, 0, 13);
+    host->lua.createtable(L, 0, 14);
     set_string_field(L, host, "VERSION", JPG_VERSION);
     set_string_field(L, host, "DESCRIPTION", JPG_MODULE_DESCRIPTION);
     set_string_field(L, host, "OUTPUT_FORMAT", "RGB565");
@@ -1668,6 +1790,7 @@ JPG_MODULE_EXPORT int32_t module_luaopen_v1(void *instance, lua_State *L)
     set_closure_field(L, host, "submit", l_jpg_submit, inst);
     set_closure_field(L, host, "ready", l_jpg_ready, inst);
     set_closure_field(L, host, "read_ready", l_jpg_read_ready, inst);
+    set_closure_field(L, host, "read_ready_image", l_jpg_read_ready_image, inst);
     set_closure_field(L, host, "present_ready", l_jpg_present_ready, inst);
     set_closure_field(L, host, "release", l_jpg_release, inst);
     set_closure_field(L, host, "stats", l_jpg_stats, inst);
