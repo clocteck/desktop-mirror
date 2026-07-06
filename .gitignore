@@ -11,6 +11,8 @@ venv/
 build/
 device/src/build/
 device/src/managed_components/
+native_module/src/build/
+native_module/src/managed_components/
 sdkconfig
 sdkconfig.old
 

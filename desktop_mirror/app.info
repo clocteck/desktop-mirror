@@ -1,3 +1,0 @@
-name = Desktop Mirror
-entry = main.lua
-description = Pure Lua desktop mirror receiver

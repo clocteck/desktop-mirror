@@ -1,0 +1,5 @@
+name = Desktop Mirror Native
+entry = main.lua
+description = Desktop mirror receiver with native JPEG module
+kind = app
+version = 0.1.0

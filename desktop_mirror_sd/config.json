@@ -1,0 +1,17 @@
+{
+  "url": "ws://192.168.0.80:8787",
+  "module_path": "/sd/apps/desktop_mirror_sd/modules/jpg.so",
+  "native_jpg": true,
+  "ws_buffer": 32768,
+  "native_gc_every": 1,
+  "native_chunk_rows": 16,
+  "native_chunked": false,
+  "native_direct_present": false,
+  "native_img_userdata": true,
+  "native_async": true,
+  "native_swap_color_bytes": false,
+  "overlay": false,
+  "serial_debug": true,
+  "serial_debug_every": 1,
+  "serial_debug_interval_ms": 5000
+}
