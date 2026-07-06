@@ -1,29 +1,64 @@
-# 桌面投屏
+# Desktop Mirror
 
-本工程按两端拆分：
+Desktop Mirror 是一个面向 Cubic 320x240 屏幕的桌面投屏 app。电脑端使用 Python 截图、缩放并编码为 JPEG，通过 WebSocket 推送；设备端使用 Lua + LVGL 接收并显示。
 
-- `device/`：设备端 Lua 应用，复制到 SD 卡 `/sd/apps/`。
-- `computer/`：电脑端 Python 推流程序，负责截图、压缩和 WebSocket 发送。
-- `device/src/`：可选 JPEG 原生解码动态模块源码，构建产物为 `jpg.so`。
+本分支是纯 Lua 版本，不需要动态模块，部署最简单。
 
-## 部署
+## 仓库结构
 
-1. 电脑安装依赖：
+- `desktop_mirror/`：可安装 app 目录。
+- `desktop_mirror/app.info`：app 元信息，遵循 holocubic-apps 的 app 格式。
+- `desktop_mirror/main.lua`：设备端入口脚本。
+- `desktop_mirror/config.json`：设备端连接配置。
+- `computer/`：电脑端推流程序和依赖安装脚本，不是设备 app。
+
+## app.info
+
+```ini
+name = Desktop Mirror
+entry = main.lua
+description = Pure Lua desktop mirror receiver
+```
+
+## 部署电脑端
+
+1. 在电脑上安装 Python 3。
+
+2. 在仓库根目录安装推流依赖：
 
    ```bat
-   cd C:\Users\wzh\Documents\PlatformIO\Projects\桌面投屏\computer
-   install_deps.bat
+   computer\install_deps.bat
    ```
 
-2. 启动电脑端：
+3. 启动推流服务：
 
    ```bat
-   start_mirror.bat
+   computer\start_mirror.bat --fps 20 --quality 65
    ```
 
-   程序启动后会打印可用地址，例如 `ws://192.168.x.x:8787`。
+   启动后会打印可用地址，例如：
 
-3. 修改 `device/desktop_mirror_sd.json`：
+   ```text
+   ws://192.168.0.80:8787
+   ```
+
+4. 可选：查看显示器编号并指定显示器：
+
+   ```bat
+   py -3 computer\desktop_mirror_server.py --list-monitors
+   computer\start_mirror.bat --monitor 2 --fps 20 --quality 65
+   ```
+
+5. 可选：Windows 上安装 dxcam 截图后端：
+
+   ```bat
+   py -3 -m pip install -r computer\requirements-dxcam.txt
+   computer\start_mirror.bat --capture dxcam --dxcam-live --fps 20 --quality 65
+   ```
+
+## 部署设备端
+
+1. 修改 `desktop_mirror/config.json`，把 `url` 改成电脑端打印的 WebSocket 地址：
 
    ```json
    {
@@ -31,88 +66,34 @@
    }
    ```
 
-4. 把这两个文件复制到设备 SD 卡：
+2. 将整个 `desktop_mirror/` 目录复制到设备 SD 卡：
 
-   - `device/desktop_mirror_sd.lua` -> `/sd/apps/desktop_mirror_sd.lua`
-   - `device/desktop_mirror_sd.json` -> `/sd/apps/desktop_mirror_sd.json`
+   ```text
+   /sd/apps/desktop_mirror/
+     app.info
+     main.lua
+     config.json
+   ```
 
-5. 设备和电脑连同一个局域网，打开设备上的 `desktop_mirror_sd.lua` 应用。Windows 第一次运行时需要允许防火墙访问 `8787` 端口。
+3. 设备和电脑连接同一个局域网。
 
-## 可选原生 JPEG 解码模块
+4. 在设备启动器中打开 `Desktop Mirror`。
 
-这个模块只做 `JPEG -> RGB565` 解码，不直接操作屏幕；Lua 仍用 LVGL canvas 推屏。
+Windows 第一次运行电脑端服务时，需要允许防火墙访问 `8787` 端口。
 
-构建：
+## 运行参数
 
-```bat
-cd C:\Users\wzh\Documents\PlatformIO\Projects\桌面投屏\device
-build_jpg.bat
-```
+- `--fps 20`：目标帧率，设备端压力大时可降到 `15`。
+- `--quality 65`：JPEG 质量，常用范围 `60` 到 `75`。
+- `--width 320 --height 240`：输出尺寸，默认匹配 Cubic 屏幕。
+- `--fit stretch`：默认拉伸填满屏幕。
 
-需要先在当前终端加载 ESP-IDF 环境，让 `idf.py` 和 `IDF_PATH` 可用。构建成功后复制：
+## 设备按键
 
-```text
-device/src/build/jpg.so -> /sd/modules/jpg.so
-```
-
-`desktop_mirror_sd.json` 默认已启用：
-
-```json
-{
-  "module_path": "/sd/modules/jpg.so",
-  "native_jpg": true
-}
-```
-
-模块加载成功后，设备端流程变为：WebSocket 收 JPEG -> `jpg.so` 解码 RGB565 -> `lv_canvas_blit_rgb565()` 写入 LVGL canvas。模块不存在或加载失败时，会自动回退到原来的 `lv_img_set_src(jpeg)`。
-
-## 常用参数
-
-查看显示器编号：
-
-```bat
-py -3 computer\desktop_mirror_server.py --list-monitors
-```
-
-指定显示器、降低码率：
-
-```bat
-computer\start_mirror.bat --monitor 2 --fps 20 --quality 65
-```
-
-Windows 上想尝试更快截图：
-
-```bat
-py -3 -m pip install -r computer\requirements-dxcam.txt
-computer\start_mirror.bat --capture dxcam --dxcam-live --fps 20 --quality 65
-```
-
-如果画面仍有截屏侧撕裂，可以试 Windows Graphics Capture 后端：
-
-```bat
-computer\start_mirror.bat --capture dxcam --dxcam-backend winrt --dxcam-live --fps 20 --quality 65
-```
-
-设备按键：
-
-- `LEFT`：显示/隐藏状态浮层。
+- `LEFT`：显示或隐藏状态浮层。
 - `RIGHT`：手动重连。
-- `DOWN`：暂停/恢复画面。
+- `DOWN`：暂停或恢复画面。
 
-## 实现过程
+## 协议说明
 
-电脑端参考原项目协议：截图后缩放到 `320x240`，编码成 JPEG，用 `DMJ1` 二进制头记录帧号、尺寸、质量和耗时，再通过 WebSocket 二进制帧发送。
-
-设备端 Lua 启动后读取 `/sd/apps/desktop_mirror_sd.json`，主动连接电脑端 WebSocket，收到二进制帧后校验 `DMJ1` 头，把 JPEG 数据交给 `lv_img_set_src()` 显示，并带有自动重连、丢帧统计和串口性能日志。
-
-## 帧率优化想法
-
-当前版本瓶颈通常在设备端 JPEG 解码和 LVGL 刷新。短期优先调 `--quality 60~75`、`--fps 15~24`、`--capture dxcam --dxcam-live`，并通过串口日志看 `lv_set_src`、`native_decode`、`present` 和 `mon_fps`。
-
-低延迟优先时，电脑端默认只允许较小 WebSocket 发送积压，并启用 `TCP_NODELAY`。如果日志里 `drop_out` 增多但延迟下降，这是正常取舍；如果画面明显卡顿，再适当降低 `--fps` 或 `--quality`。
-
-当前 `jpg.so` 已经绕过 LVGL 自带 JPEG 解码，但仍然由 Lua/LVGL canvas 推屏。下一步如果要更高帧率，可以把 WebSocket 收包和 JPEG 解码放到核心 0 的模块任务里，只把最新 RGB565 帧交给核心 1/LVGL 提交。LVGL 本身不线程安全，所以不能在两个核心同时操作 LVGL 对象。
-
-最高帧率方案是全屏投屏时绕过 LVGL，解码后直接用 `esp_lcd_panel_draw_bitmap` 或屏幕驱动 DMA 推 RGB565。这样会牺牲 LVGL 叠层便利性，但可以减少 `lv_img_set_src()`、图片解码器和对象刷新开销。
-
-`.so` 动态模块要看当前 Lua 固件是否支持运行时加载 C 模块；ESP32 上更稳的做法通常是把 native mirror 作为 ESP-IDF/Arduino 组件编进固件，再给 Lua 暴露 `present_jpeg()` 或 `present_rgb565()` API。
+电脑端将桌面画面缩放到 `320x240`，编码成 JPEG，并在二进制帧前加入 `DMJ1` 头部，记录帧号、尺寸、质量和耗时信息。设备端收到 WebSocket 二进制帧后解析头部，将 JPEG 数据交给 LVGL 显示。

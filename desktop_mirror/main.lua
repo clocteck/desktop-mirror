@@ -20,8 +20,8 @@ local MAGIC_M = 77
 local MAGIC_J = 74
 local MAGIC_1 = 49
 
-APP.url = "ws://192.168.31.188:8787"
-APP.config_path = "/sd/apps/pure_lua_desktop_mirror.json"
+APP.url = "ws://192.168.0.80:8787"
+APP.config_path = "/sd/apps/desktop_mirror/config.json"
 APP.ws_buffer = 8192
 APP.serial_debug = true
 APP.serial_debug_every = 1
