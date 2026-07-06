@@ -83,8 +83,14 @@ computer\start_mirror.bat --monitor 2 --fps 20 --quality 65
 Windows 上想尝试更快截图：
 
 ```bat
-py -3 -m pip install dxcam opencv-python numpy mss
-computer\start_mirror.bat --capture dxcam
+py -3 -m pip install -r computer\requirements-dxcam.txt
+computer\start_mirror.bat --capture dxcam --dxcam-live --fps 20 --quality 65
+```
+
+如果画面仍有截屏侧撕裂，可以试 Windows Graphics Capture 后端：
+
+```bat
+computer\start_mirror.bat --capture dxcam --dxcam-backend winrt --dxcam-live --fps 20 --quality 65
 ```
 
 设备按键：
@@ -101,7 +107,9 @@ computer\start_mirror.bat --capture dxcam
 
 ## 帧率优化想法
 
-当前版本瓶颈通常在设备端 JPEG 解码和 LVGL 刷新。短期优先调 `--quality 60~75`、`--fps 15~24`、`--capture dxcam`，并通过串口日志看 `lv_set_src` 和 `mon_fps`。
+当前版本瓶颈通常在设备端 JPEG 解码和 LVGL 刷新。短期优先调 `--quality 60~75`、`--fps 15~24`、`--capture dxcam --dxcam-live`，并通过串口日志看 `lv_set_src`、`native_decode`、`present` 和 `mon_fps`。
+
+低延迟优先时，电脑端默认只允许较小 WebSocket 发送积压，并启用 `TCP_NODELAY`。如果日志里 `drop_out` 增多但延迟下降，这是正常取舍；如果画面明显卡顿，再适当降低 `--fps` 或 `--quality`。
 
 当前 `jpg.so` 已经绕过 LVGL 自带 JPEG 解码，但仍然由 Lua/LVGL canvas 推屏。下一步如果要更高帧率，可以把 WebSocket 收包和 JPEG 解码放到核心 0 的模块任务里，只把最新 RGB565 帧交给核心 1/LVGL 提交。LVGL 本身不线程安全，所以不能在两个核心同时操作 LVGL 对象。
 

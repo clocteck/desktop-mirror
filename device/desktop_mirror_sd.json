@@ -1,6 +1,6 @@
 {
   "url": "ws://192.168.31.188:8787",
-  "module_path": "/sd/modules/jpg.so",
+  "module_path": "/sd/apps/desktop_mirror_sd/modules/jpg.so",
   "native_jpg": true,
   "ws_buffer": 32768,
   "native_gc_every": 1,

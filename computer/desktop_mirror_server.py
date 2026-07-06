@@ -23,7 +23,7 @@ HEADER_LEN = HEADER.size
 DEFAULT_FPS = 24.0
 DEFAULT_JPEG_QUALITY = 75
 DEFAULT_SEND_TIMEOUT_MS = 1000
-DEFAULT_MAX_PENDING_KB = 128
+DEFAULT_MAX_PENDING_KB = 64
 
 
 def ms_since(start: float) -> int:
@@ -246,6 +246,10 @@ class DxcamScreenSource:
         list_monitors: bool,
         region: tuple[int, int, int, int] | None,
         keep_4_3: bool,
+        backend: str,
+        live: bool,
+        video_mode: bool,
+        target_fps: float,
     ) -> None:
         try:
             import cv2
@@ -260,6 +264,7 @@ class DxcamScreenSource:
         self.cv2 = cv2
         self.np = np
         self.last_frame = None
+        self.live = live
 
         with mss.mss() as sct:
             monitors = sct.monitors
@@ -315,12 +320,30 @@ class DxcamScreenSource:
             rel_top = base_region[1] - self.monitor_top
             self.region = (rel_left, rel_top, rel_left + base_region[2], rel_top + base_region[3])
 
-        self.camera = dxcam.create(output_idx=monitor - 1, output_color="BGR")
+        create_kwargs = {
+            "output_idx": monitor - 1,
+            "output_color": "BGR",
+            "backend": backend,
+        }
+        try:
+            self.camera = dxcam.create(**create_kwargs)
+        except TypeError:
+            if backend != "dxgi":
+                raise
+            create_kwargs.pop("backend", None)
+            self.camera = dxcam.create(**create_kwargs)
         if not self.camera:
             raise SystemExit("dxcam.create() failed")
+        if self.live:
+            self.camera.start(
+                region=self.region,
+                target_fps=max(1, int(target_fps + 0.5)),
+                video_mode=video_mode,
+            )
 
         print(
             "[capture] backend=dxcam "
+            f"dxcam_backend={backend} live={self.live} video_mode={video_mode} "
             f"monitor={monitor} region={base_region[0]},{base_region[1]},{base_region[2]},{base_region[3]}"
         )
 
@@ -355,7 +378,10 @@ class DxcamScreenSource:
 
     def capture_jpeg(self, width: int, height: int, fit: str, quality: int) -> tuple[bytes, int, int, int]:
         t0 = time.perf_counter()
-        frame = self.camera.grab(region=self.region)
+        if self.live:
+            frame = self.camera.get_latest_frame()
+        else:
+            frame = self.camera.grab(region=self.region)
         if frame is None:
             frame = self.last_frame
         if frame is None:
@@ -455,6 +481,10 @@ async def read_ws_frame(reader: asyncio.StreamReader) -> tuple[int, bytes]:
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, clients: ClientSet) -> None:
     peer = writer.get_extra_info("peername")
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        with contextlib.suppress(Exception):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         request = await reader.readuntil(b"\r\n\r\n")
         headers = {}
@@ -489,9 +519,15 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         while True:
             opcode, payload = await read_ws_frame(reader)
             if opcode == 8:
+                with contextlib.suppress(Exception):
+                    writer.write(pack_ws_frame(payload[:125], opcode=8))
+                    await writer.drain()
                 break
-            # Device-side dropping does not require ACK; consume text frames
-            # so close/ping handling can keep this read loop alive.
+            if opcode == 9:
+                writer.write(pack_ws_frame(payload[:125], opcode=10))
+                await writer.drain()
+            # Device-side dropping does not require ACK; consume data/pong frames
+            # so close and heartbeat handling can keep this read loop alive.
     except (asyncio.IncompleteReadError, ConnectionError):
         pass
     except Exception as exc:
@@ -611,6 +647,22 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default="mss",
         help="Capture backend. dxcam is faster on many Windows systems but needs optional dependencies.",
     )
+    parser.add_argument(
+        "--dxcam-backend",
+        choices=("dxgi", "winrt"),
+        default="dxgi",
+        help="dxcam capture backend, default: dxgi. Try winrt if dxgi tears or misses the cursor.",
+    )
+    parser.add_argument(
+        "--dxcam-live",
+        action="store_true",
+        help="Use dxcam's continuous capture thread and read the latest frame.",
+    )
+    parser.add_argument(
+        "--dxcam-video-mode",
+        action="store_true",
+        help="With --dxcam-live, reuse the previous frame to keep output pacing stable.",
+    )
     parser.add_argument("--monitor", type=int, default=1, help="Monitor index, default: 1")
     parser.add_argument(
         "--monitor-resolution",
@@ -636,7 +688,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         "--max-pending-kb",
         type=int,
         default=DEFAULT_MAX_PENDING_KB,
-        help="Skip a live frame for a client when its socket output queue exceeds this, default: 128",
+        help=f"Skip a live frame for a client when its socket output queue exceeds this, default: {DEFAULT_MAX_PENDING_KB}",
     )
     args = parser.parse_args(list(argv))
     args.quality = max(1, min(95, args.quality))
@@ -653,6 +705,10 @@ async def main_async(args: argparse.Namespace) -> None:
             args.list_monitors,
             args.region,
             not args.no_keep_4_3,
+            args.dxcam_backend,
+            args.dxcam_live,
+            args.dxcam_video_mode,
+            args.fps,
         )
     else:
         source = ScreenSource(

@@ -20,10 +20,45 @@
 #define JPG_DMA_MIN_ROWS 1u
 #define JPG_DMA_BUFFERS 2u
 #define JPG_ASYNC_RGB_BUFFERS 2u
+#define JPG_IMAGE_POOL_SLOTS 1u
+#define JPG_IMAGE_POOL_HOLD_FRAMES 3u
+#define JPG_IMAGE_POOL_WIDTH 320u
+#define JPG_IMAGE_POOL_HEIGHT 240u
+#define JPG_IMAGE_POOL_BYTES (JPG_IMAGE_POOL_WIDTH * JPG_IMAGE_POOL_HEIGHT * 2u)
+#define JPG_IMAGE_POOL_GUARD_BYTES 32u
+#define JPG_IMAGE_POOL_ALLOC_BYTES (JPG_IMAGE_POOL_BYTES + (JPG_IMAGE_POOL_GUARD_BYTES * 2u))
+#define JPG_DECODE_TASK_STACK_BYTES (16u * 1024u)
 #define JPG_ENABLE_LVGL_USERDATA 1
 #define JPG_LV_IMG_CF_TRUE_COLOR 4u
 #define JPG_USE_ESP_NEW_JPEG 1
 #define JPG_CLOSE_NEW_DECODER_ON_DESTROY 0
+
+#define JPG_IMAGE_SLOT_FREE 0u
+#define JPG_IMAGE_SLOT_DECODING 1u
+#define JPG_IMAGE_SLOT_READY 2u
+#define JPG_IMAGE_SLOT_HELD 3u
+
+#ifndef MALLOC_CAP_EXEC
+#define MALLOC_CAP_EXEC (1u << 0)
+#endif
+#ifndef MALLOC_CAP_32BIT
+#define MALLOC_CAP_32BIT (1u << 1)
+#endif
+#ifndef MALLOC_CAP_8BIT
+#define MALLOC_CAP_8BIT (1u << 2)
+#endif
+#ifndef MALLOC_CAP_DMA
+#define MALLOC_CAP_DMA (1u << 3)
+#endif
+#ifndef MALLOC_CAP_SPIRAM
+#define MALLOC_CAP_SPIRAM (1u << 10)
+#endif
+#ifndef MALLOC_CAP_INTERNAL
+#define MALLOC_CAP_INTERNAL (1u << 11)
+#endif
+#ifndef MALLOC_CAP_DEFAULT
+#define MALLOC_CAP_DEFAULT (1u << 12)
+#endif
 
 typedef struct jpg_lv_img_header_t {
     uint32_t cf : 5;
@@ -49,6 +84,7 @@ typedef struct jpg_lv_img_dsc_t {
 
 typedef struct jpg_instance_t {
     module_host_api_v2 host;
+    lua_State *lua_state;
     uint8_t *jpeg;
     size_t jpeg_cap;
     size_t jpeg_len;
@@ -70,6 +106,21 @@ typedef struct jpg_instance_t {
     uint32_t async_rgb_len[JPG_ASYNC_RGB_BUFFERS];
     uint32_t async_rgb_frame_id[JPG_ASYNC_RGB_BUFFERS];
     uint32_t async_rgb_input_bytes[JPG_ASYNC_RGB_BUFFERS];
+    jpg_lv_img_dsc_t *image_pool_dsc[JPG_IMAGE_POOL_SLOTS];
+    uint8_t *image_pool_raw[JPG_IMAGE_POOL_SLOTS];
+    uint8_t *image_pool_pixels[JPG_IMAGE_POOL_SLOTS];
+    int image_pool_ref[JPG_IMAGE_POOL_SLOTS];
+    uint32_t image_pool_next;
+    uint32_t image_pool_corrupt_count;
+    uint8_t image_pool_state[JPG_IMAGE_POOL_SLOTS];
+    uint32_t image_pool_frame_id[JPG_IMAGE_POOL_SLOTS];
+    uint32_t image_pool_input_bytes[JPG_IMAGE_POOL_SLOTS];
+    uint32_t image_pool_output_bytes[JPG_IMAGE_POOL_SLOTS];
+    uint32_t image_pool_display_seq[JPG_IMAGE_POOL_SLOTS];
+    uint32_t image_pool_present_seq;
+    uint32_t image_pool_no_slot_count;
+    uint32_t image_pool_forced_reuse_count;
+    uint8_t image_pool_ready;
     struct jpg_aligned_alloc_t *aligned_allocs;
     jpeg_dec_handle_t new_dec;
     uint8_t new_dec_swap;
@@ -93,6 +144,7 @@ typedef struct jpg_instance_t {
     volatile int async_ready_index;
     volatile int async_presenting_index;
     volatile int async_decode_index;
+    volatile int image_pool_current_slot;
     volatile uint32_t async_pending_seq;
     volatile uint32_t async_consumed_seq;
     uint32_t async_pending_frame_id;
@@ -223,23 +275,49 @@ JPG_LOCAL_SYMBOL void *memmove(void *dst, const void *src, size_t len)
     return dst;
 }
 
+static uint32_t jpg_module_caps_from_idf(uint32_t caps)
+{
+    uint32_t out = 0;
+
+    if (caps == 0 || (caps & MALLOC_CAP_DEFAULT)) {
+        return MODULE_HEAP_DEFAULT;
+    }
+    if (caps & MALLOC_CAP_INTERNAL) {
+        out |= MODULE_HEAP_INTERNAL;
+    }
+    if (caps & MALLOC_CAP_SPIRAM) {
+        out |= MODULE_HEAP_PSRAM;
+    }
+    if (caps & MALLOC_CAP_DMA) {
+        out |= MODULE_HEAP_DMA;
+    }
+    if (caps & MALLOC_CAP_EXEC) {
+        out |= MODULE_HEAP_EXEC;
+    }
+    if (caps & MALLOC_CAP_8BIT) {
+        out |= MODULE_HEAP_8BIT;
+    }
+    if (caps & MALLOC_CAP_32BIT) {
+        out |= MODULE_HEAP_32BIT;
+    }
+    return out ? out : MODULE_HEAP_DEFAULT;
+}
+
 JPG_LOCAL_SYMBOL void *heap_caps_malloc(size_t size, uint32_t caps)
 {
     jpg_instance_t *inst = s_instance;
-    uint32_t module_caps = MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT;
-    (void)caps;
     if (!inst || !inst->host.heap.malloc || size == 0) {
         return NULL;
     }
-    return inst->host.heap.malloc(size, module_caps);
+    return inst->host.heap.malloc(size, jpg_module_caps_from_idf(caps));
 }
 
 JPG_LOCAL_SYMBOL void *malloc(size_t size)
 {
-    return heap_caps_malloc(size, MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT);
+    return heap_caps_malloc(size, MALLOC_CAP_DEFAULT);
 }
 
-JPG_LOCAL_SYMBOL void *calloc(size_t n, size_t size)
+static void *jpg_heap_calloc_caps(size_t n, size_t size, uint32_t caps)
 {
     jpg_instance_t *inst = s_instance;
     size_t total = 0;
@@ -251,14 +329,35 @@ JPG_LOCAL_SYMBOL void *calloc(size_t n, size_t size)
         return NULL;
     }
     total = n * size;
-    ptr = inst->host.heap.calloc(1, total, MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT);
+    ptr = inst->host.heap.calloc(1, total, jpg_module_caps_from_idf(caps));
     return ptr;
+}
+
+JPG_LOCAL_SYMBOL void *calloc(size_t n, size_t size)
+{
+    return jpg_heap_calloc_caps(n, size, MALLOC_CAP_DEFAULT);
+}
+
+JPG_LOCAL_SYMBOL void *heap_caps_calloc(size_t n, size_t size, uint32_t caps)
+{
+    return jpg_heap_calloc_caps(n, size, caps);
 }
 
 JPG_LOCAL_SYMBOL void *heap_caps_calloc_prefer(size_t n, size_t size, size_t num, ...)
 {
-    (void)num;
-    return calloc(n, size);
+    void *ptr = NULL;
+    va_list ap;
+
+    va_start(ap, num);
+    for (size_t i = 0; i < num; i++) {
+        uint32_t caps = va_arg(ap, uint32_t);
+        ptr = jpg_heap_calloc_caps(n, size, caps);
+        if (ptr) {
+            break;
+        }
+    }
+    va_end(ap);
+    return ptr ? ptr : calloc(n, size);
 }
 
 JPG_LOCAL_SYMBOL void *heap_caps_aligned_calloc(size_t alignment, size_t n, size_t size, uint32_t caps)
@@ -286,7 +385,7 @@ JPG_LOCAL_SYMBOL void *heap_caps_aligned_calloc(size_t alignment, size_t n, size
         return NULL;
     }
     alloc_size = total + alignment;
-    raw = inst->host.heap.calloc(1, alloc_size, MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT);
+    raw = inst->host.heap.calloc(1, alloc_size, jpg_module_caps_from_idf(caps));
     if (!raw) {
         return NULL;
     }
@@ -311,7 +410,22 @@ JPG_LOCAL_SYMBOL void *realloc(void *ptr, size_t size)
     if (!inst || !inst->host.heap.realloc) {
         return NULL;
     }
-    return inst->host.heap.realloc(ptr, size, MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT);
+    return inst->host.heap.realloc(ptr, size, MODULE_HEAP_DEFAULT);
+}
+
+JPG_LOCAL_SYMBOL void *heap_caps_realloc(void *ptr, size_t size, uint32_t caps)
+{
+    jpg_instance_t *inst = s_instance;
+    if (!inst || !inst->host.heap.realloc) {
+        return NULL;
+    }
+    if (size == 0) {
+        if (ptr && inst->host.heap.free) {
+            inst->host.heap.free(ptr);
+        }
+        return NULL;
+    }
+    return inst->host.heap.realloc(ptr, size, jpg_module_caps_from_idf(caps));
 }
 
 JPG_LOCAL_SYMBOL void heap_caps_free(void *ptr)
@@ -655,44 +769,345 @@ static int push_error(lua_State *L, const module_host_api_v2 *host, const char *
     return 2;
 }
 
-static int jpg_push_rgb565_image_userdata(lua_State *L,
-                                          jpg_instance_t *inst,
-                                          const uint8_t *rgb565,
-                                          uint32_t width,
-                                          uint32_t height,
-                                          uint32_t bytes)
+static uint8_t jpg_image_pool_pre_guard(uint32_t slot)
 {
-    jpg_lv_img_dsc_t *dsc = NULL;
-    uint8_t *pixels = NULL;
-    size_t header_size = sizeof(jpg_lv_img_dsc_t);
-    size_t total = 0;
+    return (uint8_t)(0xA5u ^ ((slot + 1u) * 17u));
+}
 
-    if (!L || !inst || !rgb565 || width == 0 || height == 0 || bytes == 0) {
-        return 0;
-    }
-    if (bytes < (uint32_t)((size_t)width * (size_t)height * 2u)) {
-        return 0;
-    }
-    total = header_size + bytes;
-    if (!inst->host.lua.newuserdata) {
-        return 0;
-    }
-    dsc = (jpg_lv_img_dsc_t *)inst->host.lua.newuserdata(L, total);
-    if (!dsc) {
-        return 0;
-    }
-    zero_bytes(dsc, header_size);
-    pixels = ((uint8_t *)dsc) + header_size;
-    copy_bytes(pixels, rgb565, bytes);
+static uint8_t jpg_image_pool_post_guard(uint32_t slot)
+{
+    return (uint8_t)(0x5Au ^ ((slot + 1u) * 29u));
+}
 
-    dsc->header.cf = JPG_LV_IMG_CF_TRUE_COLOR;
-    dsc->header.always_zero = 0;
-    dsc->header.reserved = 0;
-    dsc->header.w = width;
-    dsc->header.h = height;
-    dsc->data_size = bytes;
-    dsc->data = pixels;
+static void jpg_fill_image_pool_guard(uint8_t *raw, uint32_t slot)
+{
+    uint8_t *tail = NULL;
+    if (!raw) {
+        return;
+    }
+    tail = raw + JPG_IMAGE_POOL_GUARD_BYTES + JPG_IMAGE_POOL_BYTES;
+    for (uint32_t i = 0; i < JPG_IMAGE_POOL_GUARD_BYTES; i++) {
+        raw[i] = jpg_image_pool_pre_guard(slot);
+        tail[i] = jpg_image_pool_post_guard(slot);
+    }
+}
+
+static int jpg_check_image_pool_guard(jpg_instance_t *inst, uint32_t slot)
+{
+    uint8_t *raw = NULL;
+    uint8_t *tail = NULL;
+    int ok = 1;
+
+    if (!inst || slot >= JPG_IMAGE_POOL_SLOTS) {
+        return 0;
+    }
+    raw = inst->image_pool_raw[slot];
+    if (!raw) {
+        return 0;
+    }
+    tail = raw + JPG_IMAGE_POOL_GUARD_BYTES + JPG_IMAGE_POOL_BYTES;
+    for (uint32_t i = 0; i < JPG_IMAGE_POOL_GUARD_BYTES; i++) {
+        if (raw[i] != jpg_image_pool_pre_guard(slot) ||
+            tail[i] != jpg_image_pool_post_guard(slot)) {
+            ok = 0;
+            break;
+        }
+    }
+    if (!ok) {
+        inst->image_pool_corrupt_count++;
+        if (inst->host.serial.println && inst->image_pool_corrupt_count <= 8u) {
+            inst->host.serial.println("[jpg.so] image pool guard corrupted");
+        }
+    }
+    return ok;
+}
+
+static void jpg_release_image_pool(jpg_instance_t *inst)
+{
+    if (!inst) {
+        return;
+    }
+    for (uint32_t i = 0; i < JPG_IMAGE_POOL_SLOTS; i++) {
+        if (inst->lua_state && inst->host.lua.registry_unref && inst->image_pool_ref[i] > 0) {
+            inst->host.lua.registry_unref(inst->lua_state, inst->image_pool_ref[i]);
+        }
+        if (inst->image_pool_raw[i] && inst->host.heap.free) {
+            inst->host.heap.free(inst->image_pool_raw[i]);
+        }
+        inst->image_pool_ref[i] = 0;
+        inst->image_pool_dsc[i] = NULL;
+        inst->image_pool_raw[i] = NULL;
+        inst->image_pool_pixels[i] = NULL;
+        inst->image_pool_state[i] = JPG_IMAGE_SLOT_FREE;
+        inst->image_pool_frame_id[i] = 0;
+        inst->image_pool_input_bytes[i] = 0;
+        inst->image_pool_output_bytes[i] = 0;
+        inst->image_pool_display_seq[i] = 0;
+    }
+    inst->image_pool_ready = 0;
+    inst->image_pool_next = 0;
+    inst->image_pool_present_seq = 0;
+    inst->image_pool_no_slot_count = 0;
+    inst->image_pool_forced_reuse_count = 0;
+    inst->image_pool_current_slot = -1;
+}
+
+static int jpg_init_image_pool(lua_State *L, jpg_instance_t *inst)
+{
+    const size_t userdata_size = sizeof(jpg_lv_img_dsc_t);
+    int top = 0;
+
+    if (!L || !inst || !inst->host.lua.newuserdata ||
+        !inst->host.lua.registry_ref || !inst->host.lua.registry_rawgeti ||
+        !inst->host.heap.malloc || !inst->host.heap.free) {
+        return 0;
+    }
+    if (inst->image_pool_ready) {
+        return 1;
+    }
+
+    top = inst->host.lua.gettop ? inst->host.lua.gettop(L) : 0;
+    inst->lua_state = L;
+    for (uint32_t i = 0; i < JPG_IMAGE_POOL_SLOTS; i++) {
+        jpg_lv_img_dsc_t *dsc = NULL;
+        uint8_t *raw = NULL;
+        uint8_t *pixels = NULL;
+        int ref = 0;
+
+        dsc = (jpg_lv_img_dsc_t *)inst->host.lua.newuserdata(L, userdata_size);
+        if (!dsc) {
+            if (inst->host.lua.settop) {
+                inst->host.lua.settop(L, top);
+            }
+            jpg_release_image_pool(inst);
+            return 0;
+        }
+        zero_bytes(dsc, userdata_size);
+
+        raw = (uint8_t *)inst->host.heap.malloc(JPG_IMAGE_POOL_ALLOC_BYTES, MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT);
+        if (!raw) {
+            if (inst->host.lua.settop) {
+                inst->host.lua.settop(L, top);
+            }
+            jpg_release_image_pool(inst);
+            return 0;
+        }
+
+        pixels = raw + JPG_IMAGE_POOL_GUARD_BYTES;
+        zero_bytes(pixels, JPG_IMAGE_POOL_BYTES);
+        jpg_fill_image_pool_guard(raw, i);
+
+        dsc->header.cf = JPG_LV_IMG_CF_TRUE_COLOR;
+        dsc->header.always_zero = 0;
+        dsc->header.reserved = 0;
+        dsc->header.w = JPG_IMAGE_POOL_WIDTH;
+        dsc->header.h = JPG_IMAGE_POOL_HEIGHT;
+        dsc->data_size = JPG_IMAGE_POOL_BYTES;
+        dsc->data = pixels;
+
+        ref = inst->host.lua.registry_ref(L);
+        if (ref <= 0) {
+            inst->host.heap.free(raw);
+            if (inst->host.lua.settop) {
+                inst->host.lua.settop(L, top);
+            }
+            jpg_release_image_pool(inst);
+            return 0;
+        }
+
+        inst->image_pool_dsc[i] = dsc;
+        inst->image_pool_ref[i] = ref;
+        inst->image_pool_raw[i] = raw;
+        inst->image_pool_pixels[i] = pixels;
+        inst->image_pool_state[i] = JPG_IMAGE_SLOT_FREE;
+        inst->image_pool_frame_id[i] = 0;
+        inst->image_pool_input_bytes[i] = 0;
+        inst->image_pool_output_bytes[i] = 0;
+        inst->image_pool_display_seq[i] = 0;
+    }
+
+    inst->image_pool_next = 0;
+    inst->image_pool_present_seq = 0;
+    inst->image_pool_no_slot_count = 0;
+    inst->image_pool_forced_reuse_count = 0;
+    inst->image_pool_current_slot = -1;
+    inst->image_pool_ready = 1;
     return 1;
+}
+
+static int jpg_image_pool_slot_available_locked(jpg_instance_t *inst, uint32_t slot, int enforce_hold)
+{
+    uint32_t seq = 0;
+    uint32_t last_seq = 0;
+    uint32_t age = 0;
+
+    if (!inst || slot >= JPG_IMAGE_POOL_SLOTS ||
+        !inst->image_pool_ready || !inst->image_pool_pixels[slot] ||
+        !inst->image_pool_dsc[slot] || inst->image_pool_ref[slot] <= 0) {
+        return 0;
+    }
+    if ((int)slot == inst->async_decode_index ||
+        (int)slot == inst->async_ready_index ||
+        (int)slot == inst->async_presenting_index ||
+        (int)slot == inst->image_pool_current_slot) {
+        return 0;
+    }
+    if (inst->image_pool_state[slot] == JPG_IMAGE_SLOT_DECODING ||
+        inst->image_pool_state[slot] == JPG_IMAGE_SLOT_READY) {
+        return 0;
+    }
+    if (!enforce_hold) {
+        return 1;
+    }
+
+    last_seq = inst->image_pool_display_seq[slot];
+    if (last_seq == 0) {
+        return 1;
+    }
+    seq = inst->image_pool_present_seq;
+    age = seq >= last_seq ? seq - last_seq : 0;
+    return age >= JPG_IMAGE_POOL_HOLD_FRAMES;
+}
+
+static int jpg_reserve_image_pool_decode_slot_locked(jpg_instance_t *inst)
+{
+    if (!inst || !inst->image_pool_ready) {
+        return -1;
+    }
+
+    for (uint32_t pass = 0; pass < 2u; pass++) {
+        int enforce_hold = pass == 0u ? 1 : 0;
+        for (uint32_t step = 0; step < JPG_IMAGE_POOL_SLOTS; step++) {
+            uint32_t slot = (inst->image_pool_next + step) % JPG_IMAGE_POOL_SLOTS;
+            if (!jpg_image_pool_slot_available_locked(inst, slot, enforce_hold)) {
+                continue;
+            }
+            inst->image_pool_next = (slot + 1u) % JPG_IMAGE_POOL_SLOTS;
+            inst->image_pool_state[slot] = JPG_IMAGE_SLOT_DECODING;
+            inst->async_decode_index = (int)slot;
+            if (!enforce_hold) {
+                inst->image_pool_forced_reuse_count++;
+            }
+            return (int)slot;
+        }
+    }
+
+    inst->image_pool_no_slot_count++;
+    return -1;
+}
+
+static int jpg_take_ready_image_slot(jpg_instance_t *inst,
+                                     int *out_idx,
+                                     uint32_t *out_frame_id,
+                                     uint32_t *out_input_bytes,
+                                     uint32_t *out_output_bytes)
+{
+    int idx = -1;
+    if (!inst) {
+        return 0;
+    }
+
+    jpg_async_lock(inst);
+    idx = inst->async_ready_index;
+    if (idx < 0 || idx >= (int)JPG_IMAGE_POOL_SLOTS) {
+        jpg_async_unlock(inst);
+        return 0;
+    }
+    inst->async_ready_index = -1;
+    inst->async_presenting_index = idx;
+    if (out_frame_id) {
+        *out_frame_id = inst->image_pool_frame_id[idx];
+    }
+    if (out_input_bytes) {
+        *out_input_bytes = inst->image_pool_input_bytes[idx];
+    }
+    if (out_output_bytes) {
+        *out_output_bytes = inst->image_pool_output_bytes[idx];
+    }
+    inst->image_pool_present_seq++;
+    inst->image_pool_display_seq[idx] = inst->image_pool_present_seq;
+    inst->image_pool_state[idx] = JPG_IMAGE_SLOT_HELD;
+    inst->image_pool_current_slot = idx;
+    inst->async_presenting_index = -1;
+    inst->async_present_count++;
+    inst->async_last_present_frame_id = inst->image_pool_frame_id[idx];
+    inst->async_last_input_bytes = inst->image_pool_input_bytes[idx];
+    inst->async_last_output_bytes = inst->image_pool_output_bytes[idx];
+    jpg_async_unlock(inst);
+
+    if (out_idx) {
+        *out_idx = idx;
+    }
+    return 1;
+}
+
+static int jpg_take_ready_rgb_buffer(jpg_instance_t *inst,
+                                     int *out_idx,
+                                     uint8_t **out_rgb,
+                                     uint32_t *out_frame_id,
+                                     uint32_t *out_input_bytes,
+                                     uint32_t *out_output_bytes)
+{
+    int idx = -1;
+    if (!inst) {
+        return 0;
+    }
+
+    jpg_async_lock(inst);
+    idx = inst->async_ready_index;
+    if (idx < 0 || idx >= (int)JPG_ASYNC_RGB_BUFFERS) {
+        jpg_async_unlock(inst);
+        return 0;
+    }
+
+    inst->async_ready_index = -1;
+    inst->async_presenting_index = idx;
+    if (out_idx) {
+        *out_idx = idx;
+    }
+    if (out_rgb) {
+        *out_rgb = inst->async_rgb[idx];
+    }
+    if (out_frame_id) {
+        *out_frame_id = inst->async_rgb_frame_id[idx];
+    }
+    if (out_input_bytes) {
+        *out_input_bytes = inst->async_rgb_input_bytes[idx];
+    }
+    if (out_output_bytes) {
+        *out_output_bytes = inst->async_rgb_len[idx];
+    }
+    jpg_async_unlock(inst);
+    return 1;
+}
+
+static void jpg_finish_ready_rgb_buffer(jpg_instance_t *inst,
+                                        int idx,
+                                        uint32_t frame_id,
+                                        uint32_t input_bytes,
+                                        uint32_t output_bytes,
+                                        uint32_t push_us,
+                                        int ok)
+{
+    if (!inst) {
+        return;
+    }
+
+    jpg_async_lock(inst);
+    if (idx >= 0 && inst->async_presenting_index == idx) {
+        inst->async_presenting_index = -1;
+    }
+    if (ok) {
+        inst->async_present_count++;
+        inst->async_last_present_frame_id = frame_id;
+        inst->async_last_input_bytes = input_bytes;
+        inst->async_last_output_bytes = output_bytes;
+        inst->last_push_us = push_us;
+        inst->last_push_ms = push_us / 1000u;
+    } else {
+        inst->async_error_count++;
+    }
+    jpg_async_unlock(inst);
 }
 
 static uint64_t jpg_now_us(const module_host_api_v2 *host)
@@ -844,7 +1259,7 @@ static int64_t read_int_field(lua_State *L, const module_host_api_v2 *host, int 
 static void push_stats(lua_State *L, jpg_instance_t *inst)
 {
     const module_host_api_v2 *host = &inst->host;
-    host->lua.createtable(L, 0, 28);
+    host->lua.createtable(L, 0, 32);
     set_integer_field(L, host, "decode_count", inst->decode_count);
     set_integer_field(L, host, "decode_ms", inst->last_decode_ms);
     set_integer_field(L, host, "decode_us", inst->last_decode_us);
@@ -872,6 +1287,12 @@ static void push_stats(lua_State *L, jpg_instance_t *inst)
     set_integer_field(L, host, "frame_id", inst->async_last_present_frame_id);
     set_integer_field(L, host, "ready_frame_id", inst->async_last_ready_frame_id);
     set_integer_field(L, host, "input_bytes", inst->async_last_input_bytes);
+    set_integer_field(L, host, "image_pool_slots", JPG_IMAGE_POOL_SLOTS);
+    set_integer_field(L, host, "image_pool_corrupt_count", inst->image_pool_corrupt_count);
+    set_integer_field(L, host, "image_pool_hold_frames", JPG_IMAGE_POOL_HOLD_FRAMES);
+    set_integer_field(L, host, "image_pool_current_slot", inst->image_pool_current_slot >= 0 ? inst->image_pool_current_slot + 1 : 0);
+    set_integer_field(L, host, "image_pool_no_slot_count", inst->image_pool_no_slot_count);
+    set_integer_field(L, host, "image_pool_forced_reuse_count", inst->image_pool_forced_reuse_count);
 }
 
 static int jpg_async_start(jpg_instance_t *inst);
@@ -906,7 +1327,8 @@ static void jpg_async_decode_task(void *arg)
         }
 
         for (uint32_t i = 0; i < JPG_ASYNC_RGB_BUFFERS; i++) {
-            if ((int)i != inst->async_ready_index && (int)i != inst->async_presenting_index &&
+            if ((int)i != inst->async_ready_index &&
+                (int)i != inst->async_presenting_index &&
                 (int)i != inst->async_decode_index) {
                 target = (int)i;
                 break;
@@ -920,8 +1342,6 @@ static void jpg_async_decode_task(void *arg)
             }
             continue;
         }
-        inst->async_decode_index = target;
-
         if (!jpg_reserve(inst,
                          &inst->async_decode_jpeg,
                          &inst->async_decode_jpeg_cap,
@@ -940,6 +1360,7 @@ static void jpg_async_decode_task(void *arg)
             }
             continue;
         }
+        inst->async_decode_index = target;
 
         seq = inst->async_pending_seq;
         frame_id = inst->async_pending_frame_id;
@@ -954,14 +1375,14 @@ static void jpg_async_decode_task(void *arg)
                                  &inst->async_rgb_cap[target],
                                  out_cap,
                                  16u,
-                                 MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT) &&
+                                 MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT) &&
             !jpg_reserve_aligned(inst,
                                  &inst->async_rgb_raw[target],
                                  &inst->async_rgb[target],
                                  &inst->async_rgb_cap[target],
                                  out_cap,
                                  16u,
-                                 MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT)) {
+                                 MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT)) {
             jpg_async_lock(inst);
             inst->async_error_count++;
             inst->async_decode_index = -1;
@@ -1029,7 +1450,7 @@ static int jpg_async_start(jpg_instance_t *inst)
     err = inst->host.task.create_ex("jpg_decode",
                                     jpg_async_decode_task,
                                     inst,
-                                    12u * 1024u,
+                                    JPG_DECODE_TASK_STACK_BYTES,
                                     3u,
                                     1,
                                     MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT,
@@ -1062,11 +1483,13 @@ static int l_jpg_submit(lua_State *L)
     if (!jpeg || jpeg_len < 4) {
         return push_error(L, host, "jpg.submit: empty jpeg");
     }
+    if (!jpg_init_image_pool(L, inst)) {
+        return push_error(L, host, "jpg.submit: image pool init failed");
+    }
     if (host->lua.gettop(L) >= 2 && host->lua.istable(L, 2)) {
         swap = read_bool_field(L, host, 2, "swap_color_bytes", inst->swap_color_bytes);
         frame_id = (uint32_t)read_int_field(L, host, 2, "frame_id", 0);
     }
-
     if (!jpg_async_start(inst)) {
         return push_error(L, host, "jpg.submit: decode task create failed");
     }
@@ -1136,26 +1559,13 @@ static int l_jpg_read_ready(lua_State *L)
         return push_error(L, host, "jpg.read_ready: host binary Lua API missing");
     }
 
-    jpg_async_lock(inst);
-    idx = inst->async_ready_index;
-    if (idx < 0) {
-        jpg_async_unlock(inst);
+    if (!jpg_take_ready_rgb_buffer(inst, &idx, &rgb, &frame_id, &input_bytes, &output_bytes)) {
         host->lua.pushnil(L);
         return 1;
     }
-    inst->async_ready_index = -1;
-    inst->async_presenting_index = idx;
-    rgb = inst->async_rgb[idx];
-    frame_id = inst->async_rgb_frame_id[idx];
-    input_bytes = inst->async_rgb_input_bytes[idx];
-    output_bytes = inst->async_rgb_len[idx];
-    jpg_async_unlock(inst);
 
     if (!rgb || output_bytes == 0) {
-        jpg_async_lock(inst);
-        inst->async_presenting_index = -1;
-        inst->async_error_count++;
-        jpg_async_unlock(inst);
+        jpg_finish_ready_rgb_buffer(inst, idx, frame_id, input_bytes, output_bytes, 0, 0);
         return push_error(L, host, "jpg.read_ready: decoded buffer missing");
     }
 
@@ -1163,15 +1573,13 @@ static int l_jpg_read_ready(lua_State *L)
     host->lua.pushlstring(L, (const char *)rgb, output_bytes);
     t1 = jpg_now_us(host);
 
-    jpg_async_lock(inst);
-    inst->async_presenting_index = -1;
-    inst->async_present_count++;
-    inst->async_last_present_frame_id = frame_id;
-    inst->async_last_input_bytes = input_bytes;
-    inst->async_last_output_bytes = output_bytes;
-    inst->last_push_us = t1 >= t0 ? (uint32_t)(t1 - t0) : 0;
-    inst->last_push_ms = inst->last_push_us / 1000u;
-    jpg_async_unlock(inst);
+    jpg_finish_ready_rgb_buffer(inst,
+                                idx,
+                                frame_id,
+                                input_bytes,
+                                output_bytes,
+                                t1 >= t0 ? (uint32_t)(t1 - t0) : 0,
+                                1);
 
     host->lua.pushinteger(L, 320);
     host->lua.pushinteger(L, 240);
@@ -1195,42 +1603,74 @@ static int l_jpg_read_ready_image(lua_State *L)
         return push_error(L, host, "jpg.read_ready_image: instance missing");
     }
 
-    jpg_async_lock(inst);
-    idx = inst->async_ready_index;
-    if (idx < 0) {
-        jpg_async_unlock(inst);
+    if (!jpg_take_ready_rgb_buffer(inst, &idx, &rgb, &frame_id, &input_bytes, &output_bytes)) {
         host->lua.pushnil(L);
         return 1;
     }
-    inst->async_ready_index = -1;
-    inst->async_presenting_index = idx;
-    rgb = inst->async_rgb[idx];
-    frame_id = inst->async_rgb_frame_id[idx];
-    input_bytes = inst->async_rgb_input_bytes[idx];
-    output_bytes = inst->async_rgb_len[idx];
-    jpg_async_unlock(inst);
 
-    if (!rgb || output_bytes == 0) {
-        jpg_async_lock(inst);
-        inst->async_presenting_index = -1;
-        inst->async_error_count++;
-        jpg_async_unlock(inst);
+    if (!rgb || output_bytes == 0 || output_bytes > JPG_IMAGE_POOL_BYTES ||
+        !jpg_init_image_pool(L, inst) ||
+        !inst->image_pool_pixels[0] ||
+        inst->image_pool_ref[0] <= 0 ||
+        !jpg_check_image_pool_guard(inst, 0)) {
+        jpg_finish_ready_rgb_buffer(inst, idx, frame_id, input_bytes, output_bytes, 0, 0);
         return push_error(L, host, "jpg.read_ready_image: decoded buffer missing");
     }
 
     t0 = jpg_now_us(host);
-    if (!jpg_push_rgb565_image_userdata(L, inst, rgb, 320u, 240u, output_bytes)) {
-        jpg_async_lock(inst);
-        inst->async_presenting_index = -1;
-        inst->async_error_count++;
-        jpg_async_unlock(inst);
-        return push_error(L, host, "jpg.read_ready_image: userdata alloc failed");
+    copy_bytes(inst->image_pool_pixels[0], rgb, output_bytes);
+    if (!jpg_check_image_pool_guard(inst, 0)) {
+        jpg_finish_ready_rgb_buffer(inst, idx, frame_id, input_bytes, output_bytes, 0, 0);
+        return push_error(L, host, "jpg.read_ready_image: front buffer guard failed");
+    }
+    inst->image_pool_frame_id[0] = frame_id;
+    inst->image_pool_input_bytes[0] = input_bytes;
+    inst->image_pool_output_bytes[0] = output_bytes;
+    inst->image_pool_current_slot = 0;
+    inst->image_pool_state[0] = JPG_IMAGE_SLOT_HELD;
+    inst->host.lua.registry_rawgeti(L, inst->image_pool_ref[0]);
+    t1 = jpg_now_us(host);
+
+    jpg_finish_ready_rgb_buffer(inst,
+                                idx,
+                                frame_id,
+                                input_bytes,
+                                output_bytes,
+                                t1 >= t0 ? (uint32_t)(t1 - t0) : 0,
+                                1);
+
+    host->lua.pushinteger(L, 320);
+    host->lua.pushinteger(L, 240);
+    push_stats(L, inst);
+    return 4;
+}
+
+static int l_jpg_read_ready_slot(lua_State *L)
+{
+    jpg_instance_t *inst = instance_from_lua(L);
+    module_host_api_v2 *host = inst ? &inst->host : NULL;
+    int idx = -1;
+    uint32_t frame_id = 0;
+    uint32_t input_bytes = 0;
+    uint32_t output_bytes = 0;
+    uint64_t t0 = 0;
+    uint64_t t1 = 0;
+
+    if (!inst || !host) {
+        return push_error(L, host, "jpg.read_ready_slot: instance missing");
+    }
+    t0 = jpg_now_us(host);
+    if (!jpg_take_ready_image_slot(inst, &idx, &frame_id, &input_bytes, &output_bytes)) {
+        host->lua.pushnil(L);
+        return 1;
     }
     t1 = jpg_now_us(host);
 
+    if (idx < 0 || idx >= (int)JPG_IMAGE_POOL_SLOTS || output_bytes == 0) {
+        return push_error(L, host, "jpg.read_ready_slot: decoded slot missing");
+    }
+
     jpg_async_lock(inst);
-    inst->async_presenting_index = -1;
-    inst->async_present_count++;
     inst->async_last_present_frame_id = frame_id;
     inst->async_last_input_bytes = input_bytes;
     inst->async_last_output_bytes = output_bytes;
@@ -1238,6 +1678,55 @@ static int l_jpg_read_ready_image(lua_State *L)
     inst->last_push_ms = inst->last_push_us / 1000u;
     jpg_async_unlock(inst);
 
+    host->lua.pushinteger(L, idx + 1);
+    host->lua.pushinteger(L, 320);
+    host->lua.pushinteger(L, 240);
+    push_stats(L, inst);
+    return 4;
+}
+
+static int l_jpg_image_slot_count(lua_State *L)
+{
+    jpg_instance_t *inst = instance_from_lua(L);
+    module_host_api_v2 *host = inst ? &inst->host : NULL;
+
+    if (!inst || !host) {
+        return push_error(L, host, "jpg.image_slot_count: instance missing");
+    }
+    if (!jpg_init_image_pool(L, inst)) {
+        return push_error(L, host, "jpg.image_slot_count: image pool init failed");
+    }
+    host->lua.pushinteger(L, JPG_IMAGE_POOL_SLOTS);
+    push_stats(L, inst);
+    return 2;
+}
+
+static int l_jpg_image_slot(lua_State *L)
+{
+    jpg_instance_t *inst = instance_from_lua(L);
+    module_host_api_v2 *host = inst ? &inst->host : NULL;
+    int64_t slot_arg = 0;
+    int idx = -1;
+
+    if (!inst || !host) {
+        return push_error(L, host, "jpg.image_slot: instance missing");
+    }
+    if (!host->lua.checkinteger || !host->lua.registry_rawgeti) {
+        return push_error(L, host, "jpg.image_slot: host Lua API missing");
+    }
+    if (!jpg_init_image_pool(L, inst)) {
+        return push_error(L, host, "jpg.image_slot: image pool init failed");
+    }
+    slot_arg = host->lua.checkinteger(L, 1);
+    if (slot_arg < 1 || slot_arg > (int64_t)JPG_IMAGE_POOL_SLOTS) {
+        return push_error(L, host, "jpg.image_slot: slot index out of range");
+    }
+    idx = (int)slot_arg - 1;
+    if (inst->image_pool_ref[idx] <= 0) {
+        return push_error(L, host, "jpg.image_slot: slot missing");
+    }
+
+    inst->host.lua.registry_rawgeti(L, inst->image_pool_ref[idx]);
     host->lua.pushinteger(L, 320);
     host->lua.pushinteger(L, 240);
     push_stats(L, inst);
@@ -1258,36 +1747,23 @@ static int l_jpg_present_ready(lua_State *L)
         return push_error(L, host, "jpg.present_ready: instance missing");
     }
 
-    jpg_async_lock(inst);
-    idx = inst->async_ready_index;
-    if (idx < 0) {
-        jpg_async_unlock(inst);
+    if (!jpg_take_ready_rgb_buffer(inst, &idx, &rgb, &frame_id, &input_bytes, &output_bytes)) {
         host->lua.pushboolean(L, 0);
         return 1;
     }
-    inst->async_ready_index = -1;
-    inst->async_presenting_index = idx;
-    rgb = inst->async_rgb[idx];
-    frame_id = inst->async_rgb_frame_id[idx];
-    input_bytes = inst->async_rgb_input_bytes[idx];
-    output_bytes = inst->async_rgb_len[idx];
-    jpg_async_unlock(inst);
 
     if (!rgb || output_bytes == 0 || !jpg_present_rgb565(inst, rgb, 320u, 240u)) {
-        jpg_async_lock(inst);
-        inst->async_presenting_index = -1;
-        inst->async_error_count++;
-        jpg_async_unlock(inst);
+        jpg_finish_ready_rgb_buffer(inst, idx, frame_id, input_bytes, output_bytes, 0, 0);
         return push_error(L, host, "jpg.present_ready: display push failed");
     }
 
-    jpg_async_lock(inst);
-    inst->async_presenting_index = -1;
-    inst->async_present_count++;
-    inst->async_last_present_frame_id = frame_id;
-    inst->async_last_input_bytes = input_bytes;
-    inst->async_last_output_bytes = output_bytes;
-    jpg_async_unlock(inst);
+    jpg_finish_ready_rgb_buffer(inst,
+                                idx,
+                                frame_id,
+                                input_bytes,
+                                output_bytes,
+                                inst->last_push_us,
+                                1);
 
     host->lua.pushboolean(L, 1);
     push_stats(L, inst);
@@ -1375,14 +1851,14 @@ static int l_jpg_decode(lua_State *L)
                              &inst->rgb565_cap,
                              out_cap,
                              16u,
-                             MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT) &&
+                             MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT) &&
         !jpg_reserve_aligned(inst,
                              &inst->rgb565_raw,
                              &inst->rgb565,
                              &inst->rgb565_cap,
                              out_cap,
                              16u,
-                             MODULE_HEAP_PSRAM | MODULE_HEAP_8BIT)) {
+                             MODULE_HEAP_INTERNAL | MODULE_HEAP_8BIT)) {
         return push_error(L, host, "jpg.decode: rgb565 buffer alloc failed");
     }
 
@@ -1751,7 +2227,8 @@ JPG_MODULE_EXPORT int32_t module_create_v2(module_host_resolve_v2_fn resolve,
         return rc;
     }
     if (!host.heap.calloc || !host.heap.free || !host.lua.checklstring ||
-        !host.lua.pushlstring || !host.lua.newuserdata) {
+        !host.lua.pushlstring || !host.lua.newuserdata ||
+        !host.lua.registry_ref || !host.lua.registry_unref || !host.lua.registry_rawgeti) {
         return MODULE_ERR_UNSUPPORTED;
     }
 
@@ -1763,6 +2240,7 @@ JPG_MODULE_EXPORT int32_t module_create_v2(module_host_resolve_v2_fn resolve,
     inst->async_ready_index = -1;
     inst->async_presenting_index = -1;
     inst->async_decode_index = -1;
+    inst->image_pool_current_slot = -1;
     s_instance = inst;
     *out_instance = inst;
     if (host.serial.println) {
@@ -1779,7 +2257,8 @@ JPG_MODULE_EXPORT int32_t module_luaopen_v1(void *instance, lua_State *L)
         return MODULE_ERR_INVALID_ARG;
     }
 
-    host->lua.createtable(L, 0, 14);
+    inst->lua_state = L;
+    host->lua.createtable(L, 0, 17);
     set_string_field(L, host, "VERSION", JPG_VERSION);
     set_string_field(L, host, "DESCRIPTION", JPG_MODULE_DESCRIPTION);
     set_string_field(L, host, "OUTPUT_FORMAT", "RGB565");
@@ -1791,6 +2270,9 @@ JPG_MODULE_EXPORT int32_t module_luaopen_v1(void *instance, lua_State *L)
     set_closure_field(L, host, "ready", l_jpg_ready, inst);
     set_closure_field(L, host, "read_ready", l_jpg_read_ready, inst);
     set_closure_field(L, host, "read_ready_image", l_jpg_read_ready_image, inst);
+    set_closure_field(L, host, "read_ready_slot", l_jpg_read_ready_slot, inst);
+    set_closure_field(L, host, "image_slot_count", l_jpg_image_slot_count, inst);
+    set_closure_field(L, host, "image_slot", l_jpg_image_slot, inst);
     set_closure_field(L, host, "present_ready", l_jpg_present_ready, inst);
     set_closure_field(L, host, "release", l_jpg_release, inst);
     set_closure_field(L, host, "stats", l_jpg_stats, inst);
@@ -1805,6 +2287,7 @@ JPG_MODULE_EXPORT void module_destroy_v1(void *instance)
         return;
     }
     jpg_async_stop(inst);
+    jpg_release_image_pool(inst);
 #if JPG_CLOSE_NEW_DECODER_ON_DESTROY
     jpg_new_decoder_close(inst);
 #else

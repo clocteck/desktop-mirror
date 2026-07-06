@@ -22,9 +22,10 @@ local MAGIC_J = 74
 local MAGIC_1 = 49
 
 APP.url = "ws://192.168.31.188:8787"
-APP.config_path = "/sd/apps/desktop_mirror_sd.json"
-APP.module_path = "/sd/modules/jpg.so"
+APP.config_path = "/sd/apps/desktop_mirror_sd/config.json"
+APP.module_path = "/sd/apps/desktop_mirror_sd/modules/jpg.so"
 APP.ws_buffer = 32768
+APP.process_interval_ms = 3
 APP.serial_debug = true
 APP.serial_debug_every = 1
 APP.serial_debug_interval_ms = 5000
@@ -55,11 +56,25 @@ APP.out_of_order_count = 0
 APP.last_rx_ms = 0
 APP.last_error = ""
 APP.last_error_log_ms = 0
+APP.last_bad_userdata_log_ms = 0
+APP.img_userdata_hold_slots = 10
+APP.img_userdata_hold_index = 0
+APP.img_userdata_hold = {}
+APP.native_img_src_bound = false
+APP.native_img_slot_mode = false
+APP.img_slot_count = 0
+APP.active_img_slot = 0
 APP.fatal_error = nil
 APP.last_native_decode_ms = 0
 APP.last_native_decode_us = 0
 APP.last_present_ms = 0
 APP.last_present_us = 0
+APP.last_pool_corrupt_count = 0
+APP.last_pool_no_slot_count = 0
+APP.last_pool_forced_reuse_count = 0
+APP.last_async_ready_overwrites = 0
+APP.last_async_no_buffer_count = 0
+APP.last_image_slot = 0
 APP.ws = nil
 APP.jpg = nil
 APP.native_jpg = true
@@ -240,17 +255,23 @@ local function load_jpg_module()
   end
   if not require then
     APP.fatal_error = "Native JPEG requires require"
-    print("[dmirror] fatal: " .. APP.fatal_error)
+    if APP.serial_debug then
+      print("[dmirror] fatal: " .. APP.fatal_error)
+    end
     return
   end
   if APP.native_img_userdata and not lv_img_set_src then
     APP.fatal_error = "Native JPEG image mode requires lv_img_set_src"
-    print("[dmirror] fatal: " .. APP.fatal_error)
+    if APP.serial_debug then
+      print("[dmirror] fatal: " .. APP.fatal_error)
+    end
     return
   end
   if (not APP.native_direct_present) and (not APP.native_img_userdata) and (not lv_canvas_create or not lv_canvas_blit_rgb565) then
     APP.fatal_error = "Native JPEG canvas mode requires canvas/blit"
-    print("[dmirror] fatal: " .. APP.fatal_error)
+    if APP.serial_debug then
+      print("[dmirror] fatal: " .. APP.fatal_error)
+    end
     return
   end
 
@@ -258,8 +279,8 @@ local function load_jpg_module()
   local paths = {
     APP.module_path,
     "/sd/apps/jpg.so",
-    "/sd/apps/desktop_mirror/jpg.so",
-    "/sd/apps/desktop_mirror/modules/jpg.so",
+    "/sd/apps/desktop_mirror_sd/jpg.so",
+    "/sd/apps/desktop_mirror_sd/modules/jpg.so",
   }
   for _, path in ipairs(paths) do
     if path and path ~= "" then
@@ -280,7 +301,9 @@ local function load_jpg_module()
           APP.jpg = mod
           APP.native_canvas = (not APP.native_direct_present) and (not APP.native_img_userdata)
           APP.native_lvgl_image = APP.native_img_userdata
-          print("[dmirror] native jpg module loaded: " .. path)
+          if APP.serial_debug then
+            print("[dmirror] native jpg module loaded: " .. path)
+          end
           return
         end
       elseif not ok then
@@ -294,7 +317,9 @@ local function load_jpg_module()
   APP.native_canvas = false
   APP.native_lvgl_image = false
   APP.fatal_error = "Native JPEG module unavailable: " .. last_err
-  print("[dmirror] fatal: " .. APP.fatal_error)
+  if APP.serial_debug then
+    print("[dmirror] fatal: " .. APP.fatal_error)
+  end
 end
 
 local function set_obj_hidden(id, hidden)
@@ -372,6 +397,9 @@ end
 
 local function log_error(text)
   APP.last_error = tostring(text or "")
+  if not APP.serial_debug then
+    return
+  end
   if APP.last_error_log_ms == 0 or elapsed_ms(APP.last_error_log_ms) >= 1000 then
     APP.last_error_log_ms = now_ms()
     print("[dmirror] " .. APP.last_error)
@@ -405,6 +433,9 @@ local function log_receive(data, opcode)
     APP.rx_binary_count = APP.rx_binary_count + 1
   else
     APP.rx_ignored_count = APP.rx_ignored_count + 1
+  end
+  if not APP.serial_debug then
+    return
   end
 
   if APP.rx_count ~= 1 and (APP.rx_count % 120) ~= 0 and is_binary then
@@ -459,6 +490,12 @@ local function build_ui()
     APP.ui.canvas = lv_canvas_create(root, SCREEN_W, SCREEN_H, CANVAS_FMT_TRUE_COLOR)
     lv_obj_set_pos(APP.ui.canvas, 0, 0)
   else
+    APP.native_img_src_bound = false
+    APP.native_img_slot_mode = false
+    APP.active_img_slot = 0
+    APP.img_slot_count = 0
+    APP.ui.img_slots = nil
+
     APP.ui.img = lv_img_create(root)
     lv_obj_set_pos(APP.ui.img, 0, 0)
     if lv_img_set_antialias then
@@ -687,14 +724,15 @@ local function display_frame(data)
       })
     end)
     if not submit_ok or submitted_or_err ~= true then
-      fatal_stop("native submit failed: " .. tostring(submit_stats or submitted_or_err or "submit"))
+      fatal_stop("native submit failed: first=" .. type(submitted_or_err) .. ":" .. tostring(submitted_or_err) ..
+        " second=" .. type(submit_stats) .. ":" .. tostring(submit_stats))
       return
     end
     APP.submitted_frame_count = APP.submitted_frame_count + 1
     APP.last_rx_ms = now_ms()
     APP.last_error = ""
     APP.last_error_log_ms = 0
-    if submit_stats and APP.serial_debug then
+    if type(submit_stats) == "table" and APP.serial_debug then
       APP.last_native_decode_us = tonumber(submit_stats.decode_us) or APP.last_native_decode_us
       APP.last_native_decode_ms = math.floor((APP.last_native_decode_us or 0) / 1000)
     end
@@ -856,6 +894,18 @@ local function queue_frame(data)
   APP.pending_frame = data
 end
 
+local function retain_img_userdata(src)
+  if type(src) ~= "userdata" then
+    return
+  end
+  local slots = APP.img_userdata_hold_slots or 6
+  if slots < 1 then
+    slots = 1
+  end
+  APP.img_userdata_hold_index = ((APP.img_userdata_hold_index or 0) % slots) + 1
+  APP.img_userdata_hold[APP.img_userdata_hold_index] = src
+end
+
 local function process_pending_frame()
   if APP.render_busy or APP.shutting_down or APP.paused or APP.fatal_error then
     return
@@ -895,21 +945,39 @@ local function present_ready_frame()
     if img_or_err == nil then
       return
     end
+    if type(img_or_err) ~= "userdata" then
+      local ts = now_ms()
+      if ts - (APP.last_bad_userdata_log_ms or 0) > 1000 then
+        APP.last_bad_userdata_log_ms = ts
+        print("[dmirror] native read_ready_image returned " .. type(img_or_err) .. ", dropping frame")
+      end
+      return
+    end
     if out_w ~= SCREEN_W or out_h ~= SCREEN_H then
       fatal_stop("native read_ready_image size mismatch: " .. tostring(out_w) .. "x" .. tostring(out_h))
       return
     end
 
     local set_src_start_us = now_us()
-    local set_ok, set_err = pcall(function()
-      lv_img_set_src(APP.ui.img, img_or_err)
-    end)
-    if not set_ok then
-      fatal_stop("lvgl image set_src failed: " .. tostring(set_err or "set_src"))
-      return
+    if not APP.native_img_src_bound then
+      local set_ok, set_err = pcall(function()
+        lv_img_set_src(APP.ui.img, img_or_err)
+      end)
+      if not set_ok then
+        fatal_stop("lvgl image set_src failed: " .. tostring(set_err or "set_src"))
+        return
+      end
+      APP.native_img_src_bound = true
+      retain_img_userdata(img_or_err)
+    elseif lv_obj_invalidate then
+      pcall(function()
+        lv_obj_invalidate(APP.ui.img)
+      end)
     end
 
-    stats = stats or {}
+    if type(stats) ~= "table" then
+      stats = {}
+    end
     local frame_id = tonumber(stats.frame_id) or 0
     local input_bytes = tonumber(stats.input_bytes) or 0
     if frame_id > 0 then
@@ -931,6 +999,12 @@ local function present_ready_frame()
     APP.last_error_log_ms = 0
     APP.last_native_decode_us = tonumber(stats.decode_us) or APP.last_native_decode_us
     APP.last_native_decode_ms = math.floor((APP.last_native_decode_us or 0) / 1000)
+    APP.last_pool_corrupt_count = tonumber(stats.image_pool_corrupt_count) or APP.last_pool_corrupt_count
+    APP.last_pool_no_slot_count = tonumber(stats.image_pool_no_slot_count) or APP.last_pool_no_slot_count
+    APP.last_pool_forced_reuse_count = tonumber(stats.image_pool_forced_reuse_count) or APP.last_pool_forced_reuse_count
+    APP.last_async_ready_overwrites = tonumber(stats.async_ready_overwrites) or APP.last_async_ready_overwrites
+    APP.last_async_no_buffer_count = tonumber(stats.async_no_buffer_count) or APP.last_async_no_buffer_count
+    APP.last_image_slot = tonumber(stats.image_pool_current_slot) or APP.last_image_slot
     APP.last_present_us = elapsed_us(set_src_start_us)
     APP.last_present_ms = math.floor((APP.last_present_us or 0) / 1000)
 
@@ -959,7 +1033,9 @@ local function present_ready_frame()
       return
     end
 
-    stats = stats or {}
+    if type(stats) ~= "table" then
+      stats = {}
+    end
     local frame_id = tonumber(stats.frame_id) or 0
     local input_bytes = tonumber(stats.input_bytes) or 0
     if frame_id > 0 then
@@ -1027,7 +1103,9 @@ local function present_ready_frame()
     return
   end
 
-  stats = stats or {}
+  if type(stats) ~= "table" then
+    stats = {}
+  end
   local frame_id = tonumber(stats.frame_id) or 0
   local input_bytes = tonumber(stats.input_bytes) or 0
   if frame_id > 0 then
@@ -1168,7 +1246,7 @@ local function start_timers()
       update_fps_label()
       if APP.serial_debug then
         print(string.format(
-          "[dmirror][fps] display=%.1f rx=%.1f kbps=%.0f frames=%d submitted=%d drop=%d overwrite=%d empty=%d order_err=%d native_decode=%dus present=%dus",
+          "[dmirror][fps] display=%.1f rx=%.1f kbps=%.0f frames=%d submitted=%d drop=%d overwrite=%d empty=%d order_err=%d native_decode=%dus present=%dus slot=%d pool_corrupt=%d no_slot=%d force_reuse=%d ready_ow=%d no_buf=%d",
           APP.stat.fps or 0,
           APP.stat.rx_fps or 0,
           APP.stat.kbps or 0,
@@ -1179,13 +1257,19 @@ local function start_timers()
           APP.present_empty_count or 0,
           APP.out_of_order_count or 0,
           APP.last_native_decode_us or ((APP.last_native_decode_ms or 0) * 1000),
-          APP.last_present_us or ((APP.last_present_ms or 0) * 1000)
+          APP.last_present_us or ((APP.last_present_ms or 0) * 1000),
+          APP.last_image_slot or 0,
+          APP.last_pool_corrupt_count or 0,
+          APP.last_pool_no_slot_count or 0,
+          APP.last_pool_forced_reuse_count or 0,
+          APP.last_async_ready_overwrites or 0,
+          APP.last_async_no_buffer_count or 0
         ))
       end
     end)
 
     APP.process_timer = tmr.create()
-    APP.process_timer:alarm(1, tmr.ALARM_AUTO, function()
+    APP.process_timer:alarm(APP.process_interval_ms, tmr.ALARM_AUTO, function()
       process_pending_frame()
       present_ready_frame()
     end)
