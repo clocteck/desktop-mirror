@@ -97,3 +97,7 @@ Windows 第一次运行电脑端服务时，需要允许防火墙访问 `8787` �
 ## 协议说明
 
 电脑端将桌面画面缩放到 `320x240`，编码成 JPEG，并在二进制帧前加入 `DMJ1` 头部，记录帧号、尺寸、质量和耗时信息。设备端收到 WebSocket 二进制帧后解析头部，将 JPEG 数据交给 LVGL 显示。
+
+## License
+
+This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
