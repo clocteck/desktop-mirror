@@ -4,6 +4,8 @@ Desktop Mirror 是一个面向 Cubic 320x240 屏幕的桌面投屏 app。电脑�
 
 本分支是纯 Lua 版本，不需要动态模块，部署最简单。
 
+设备资料：[HoloCubic 平台介绍](https://clocteck.com/pages/holocubic) · [ClocTeck 官网](https://clocteck.com/)
+
 ## 仓库结构
 
 - `desktop_mirror/`：可安装 app 目录。

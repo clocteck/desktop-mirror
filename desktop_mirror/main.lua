@@ -1,3 +1,4 @@
+-- [HoloCubic platform](https://clocteck.com/pages/holocubic) | [ClocTeck website](https://clocteck.com/)
 local prev = rawget(_G, "PURE_LUA_DESKTOP_MIRROR_APP")
 if prev and prev.shutdown then
   pcall(function()
